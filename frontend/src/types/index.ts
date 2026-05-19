@@ -4,6 +4,7 @@ export interface SensorReading {
   hr: number;
   spo2: number;
   timestamp?: string;
+  ai_analysis?: string;
 }
 
 export interface Patient {

@@ -7,6 +7,40 @@ import { PatientDetailView } from './components/PatientDetailView';
 
 const BLOOD_GROUPS = ['A+','A-','B+','B-','AB+','AB-','O+','O-'];
 
+const generateGroqAnalysis = async (hr: number, temp: number, spo2: number, apiKey: string) => {
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: "openai/gpt-oss-120b",
+      messages: [
+            {
+              role: "system",
+              content: "You are a clinical AI health assistant. Analyze the patient's vitals (Heart Rate, Temperature, SpO2) and provide a very brief clinical overview with concise bullet points. Suggest potential actions and state clearly if any values are outside normal limits. Keep it highly professional and brief (max 120 words). Format beautifully with clean markdown. Do NOT include any introductory or concluding conversational text (e.g., 'Sure, here is...', 'Please let me know...'). Start directly with the analysis bullets and output only the clinical data."
+            },
+        {
+          role: "user",
+          content: `Patient Vitals:
+- Heart Rate: ${hr} BPM (Normal: 60-100)
+- Temperature: ${temp} °C (Normal: 36.1-37.2)
+- SpO2: ${spo2} % (Normal: 95-100)`
+        }
+      ],
+      temperature: 0.3,
+      max_tokens: 300
+    })
+  });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData?.error?.message || "Failed to generate AI analysis from Groq.");
+  }
+  const data = await response.json();
+  return data.choices[0].message.content as string;
+};
+
 export default function HospitalPortal() {
   const [view, setView] = useState<'login' | 'dashboard' | 'patient'>('login');
   const [patients, setPatients] = useState<Patient[]>([]);
@@ -39,6 +73,11 @@ export default function HospitalPortal() {
   const hrRef = useRef<number[]>([]);
   const tempRef = useRef<number[]>([]);
   const spo2Ref = useRef<number[]>([]);
+
+  // AI & HR Alert states
+  const [highHrAlert, setHighHrAlert] = useState<number | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
 
   useEffect(() => {
     const iv = setInterval(async () => {
@@ -203,6 +242,43 @@ export default function HospitalPortal() {
     } catch { }
   };
 
+  const handleGenerateAnalysis = async (readingId: number, hr: number, temp: number, spo2: number) => {
+    const key = localStorage.getItem('groq_api_key') || (import.meta.env.VITE_GROQ_API_KEY as string) || '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';
+    if (!key) {
+      alert("Please configure your Groq API Key first.");
+      return;
+    }
+    setAiLoading(true);
+    setAiError(null);
+    try {
+      const analysis = await generateGroqAnalysis(hr, temp, spo2, key);
+      if (selectedPatient) {
+        const r = await fetch(`http://${window.location.hostname}:8000/api/patients/${selectedPatient.mobile}/readings/${readingId}/analysis`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ai_analysis: analysis })
+        });
+        if (r.ok) {
+          await fetchHistory(selectedPatient.mobile);
+          setSelectedPatient(s => {
+            if (!s) return null;
+            let updatedLatest = s.latest_reading;
+            if (updatedLatest && updatedLatest.id === readingId) {
+              updatedLatest = { ...updatedLatest, ai_analysis: analysis };
+            }
+            return { ...s, latest_reading: updatedLatest };
+          });
+        } else {
+          throw new Error("Failed to save analysis in database.");
+        }
+      }
+    } catch (err: any) {
+      setAiError(err.message || "An error occurred while generating analysis.");
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
   const handleAverage = async (hr: number[], temp: number[], spo2: number[]) => {
     const avg = (a: number[], lo: number, hi: number) => {
       const v = a.filter(x => x >= lo && x <= hi);
@@ -215,16 +291,59 @@ export default function HospitalPortal() {
     const fSpo2 = avg(spo2, 50, 100) ?? rand(95, 99);
 
     if (selectedPatient) {
-      const p = { hr: Math.round(fHr), temp: parseFloat(fTemp.toFixed(1)), spo2: Math.round(fSpo2) };
+      const p = { 
+        hr: Math.round(fHr), 
+        temp: parseFloat(fTemp.toFixed(1)), 
+        spo2: Math.round(fSpo2),
+        ai_analysis: undefined as string | undefined
+      };
+      
       try {
-        await fetch(`http://${window.location.hostname}:8000/api/patients/${selectedPatient.mobile}/finalize_reading`, {
+        const r = await fetch(`http://${window.location.hostname}:8000/api/patients/${selectedPatient.mobile}/finalize_reading`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(p)
         });
-        fetchHistory(selectedPatient.mobile);
-        setSelectedPatient(s => s ? { ...s, latest_reading: { ...p, timestamp: 'Just now' } } : null);
-      } catch { }
+        
+        if (r.ok) {
+          const res = await r.json();
+          const readingId = res.id;
+          
+          fetchHistory(selectedPatient.mobile);
+          setSelectedPatient(s => s ? { ...s, latest_reading: { ...p, id: readingId, timestamp: 'Just now' } } : null);
+          
+          if (p.hr > 100) {
+            setHighHrAlert(p.hr);
+          }
+
+          const key = localStorage.getItem('groq_api_key') || (import.meta.env.VITE_GROQ_API_KEY as string) || '';
+          if (key && readingId) {
+            (async () => {
+              try {
+                const analysis = await generateGroqAnalysis(p.hr, p.temp, p.spo2, key);
+                await fetch(`http://${window.location.hostname}:8000/api/patients/${selectedPatient.mobile}/readings/${readingId}/analysis`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ ai_analysis: analysis })
+                });
+                fetchHistory(selectedPatient.mobile);
+                setSelectedPatient(s => {
+                  if (!s) return null;
+                  let updatedLatest = s.latest_reading;
+                  if (updatedLatest && updatedLatest.id === readingId) {
+                    updatedLatest = { ...updatedLatest, ai_analysis: analysis };
+                  }
+                  return { ...s, latest_reading: updatedLatest };
+                });
+              } catch (err) {
+                console.error("Auto AI Analysis failed:", err);
+              }
+            })();
+          }
+        }
+      } catch (err) {
+        console.error("Failed to finalize reading:", err);
+      }
     }
   };
 
@@ -314,6 +433,11 @@ export default function HospitalPortal() {
           history={history}
           deleteReading={deleteReading}
           deleteAllReadings={deleteAllReadings}
+          highHrAlert={highHrAlert}
+          setHighHrAlert={setHighHrAlert}
+          aiLoading={aiLoading}
+          aiError={aiError}
+          onGenerateAnalysis={handleGenerateAnalysis}
         />
       )}
     </>

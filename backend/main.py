@@ -49,6 +49,7 @@ cursor.execute('''
         hr INTEGER,
         spo2 INTEGER,
         timestamp TEXT NOT NULL,
+        ai_analysis TEXT,
         FOREIGN KEY (mobile) REFERENCES patients (mobile)
     )
 ''')
@@ -63,6 +64,13 @@ for col_def in [
         cursor.execute(f"ALTER TABLE patients ADD COLUMN {col_def[0]} {col_def[1]}")
     except sqlite3.OperationalError:
         pass  # column already exists
+
+# Migrate medical_readings for ai_analysis
+try:
+    cursor.execute("ALTER TABLE medical_readings ADD COLUMN ai_analysis TEXT")
+except sqlite3.OperationalError:
+    pass
+
 cursor.execute("INSERT OR IGNORE INTO doctors (username, password) VALUES ('dr_smith', 'password123')")
 conn.commit()
 
@@ -243,11 +251,11 @@ async def get_patients():
     patients = cursor.fetchall()
     patients_list = []
     for (mobile, name, gender, dob, blood_group, address) in patients:
-        cursor.execute("SELECT temp, hr, spo2, timestamp FROM medical_readings WHERE mobile = ? ORDER BY id DESC LIMIT 1", (mobile,))
+        cursor.execute("SELECT temp, hr, spo2, timestamp, ai_analysis FROM medical_readings WHERE mobile = ? ORDER BY id DESC LIMIT 1", (mobile,))
         latest = cursor.fetchone()
         reading = None
         if latest:
-            reading = {"temp": latest[0], "hr": latest[1], "spo2": latest[2], "timestamp": latest[3]}
+            reading = {"temp": latest[0], "hr": latest[1], "spo2": latest[2], "timestamp": latest[3], "ai_analysis": latest[4]}
         patients_list.append({"mobile": mobile, "name": name, "gender": gender, "dob": dob, "blood_group": blood_group, "address": address, "latest_reading": reading})
     return patients_list
 
@@ -373,25 +381,39 @@ class FinalizeReadingPayload(BaseModel):
     temp: float
     hr: int
     spo2: int
+    ai_analysis: Optional[str] = None
 
 @app.post("/api/patients/{mobile}/finalize_reading")
 async def finalize_reading(mobile: str, p: FinalizeReadingPayload):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute(
-        "INSERT INTO medical_readings (mobile, temp, hr, spo2, timestamp) VALUES (?, ?, ?, ?, ?)",
-        (mobile, p.temp, p.hr, p.spo2, now)
+        "INSERT INTO medical_readings (mobile, temp, hr, spo2, timestamp, ai_analysis) VALUES (?, ?, ?, ?, ?, ?)",
+        (mobile, p.temp, p.hr, p.spo2, now, p.ai_analysis)
     )
+    inserted_id = cursor.lastrowid
     conn.commit()
-    return {"status": "success"}
+    return {"status": "success", "id": inserted_id}
 
 @app.get("/api/patients/{mobile}/readings")
 async def get_patient_readings(mobile: str):
     cursor.execute(
-        "SELECT id, temp, hr, spo2, timestamp FROM medical_readings WHERE mobile = ? ORDER BY id DESC LIMIT 20",
+        "SELECT id, temp, hr, spo2, timestamp, ai_analysis FROM medical_readings WHERE mobile = ? ORDER BY id DESC LIMIT 20",
         (mobile,)
     )
     rows = cursor.fetchall()
-    return [{"id": r[0], "temp": r[1], "hr": r[2], "spo2": r[3], "timestamp": r[4]} for r in rows]
+    return [{"id": r[0], "temp": r[1], "hr": r[2], "spo2": r[3], "timestamp": r[4], "ai_analysis": r[5]} for r in rows]
+
+@app.post("/api/patients/{mobile}/readings/{reading_id}/analysis")
+async def update_reading_analysis(mobile: str, reading_id: int, payload: dict):
+    analysis = payload.get("ai_analysis")
+    cursor.execute(
+        "UPDATE medical_readings SET ai_analysis = ? WHERE id = ? AND mobile = ?",
+        (analysis, reading_id, mobile)
+    )
+    conn.commit()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Reading not found")
+    return {"status": "success"}
 
 @app.delete("/api/patients/{mobile}/readings/{reading_id}")
 async def delete_reading(mobile: str, reading_id: int):
